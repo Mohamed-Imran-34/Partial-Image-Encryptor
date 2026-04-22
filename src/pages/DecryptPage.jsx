@@ -38,77 +38,112 @@ export default function DecryptPage() {
 
     ir.onload = (e) => {
       br.onload = async (b) => {
-        try {
-          // FIXED: Processing the Base64 string from text file without stack overflow
-          const base64Content = b.target.result;
-          const binaryString = atob(base64Content);
-          const len = binaryString.length;
-          const combined = new Uint8Array(len);
-          for (let i = 0; i < len; i++) {
-            combined[i] = binaryString.charCodeAt(i);
-          }
+  try {
+    // 1. Process Base64 from the .bin file
+    const base64Content = b.target.result;
+    const binaryString = atob(base64Content);
+    const len = binaryString.length;
+    const combined = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      combined[i] = binaryString.charCodeAt(i);
+    }
 
-          const salt = combined.slice(0, 16);
-          const iv = combined.slice(16, 28);
-          const ciphertext = combined.slice(28);
+    // 2. Extract Crypto Components
+    const salt = combined.slice(0, 16);
+    const iv = combined.slice(16, 28);
+    const ciphertext = combined.slice(28);
 
-          const key = await deriveKey(password, salt);
+    // 3. Decrypt the payload
+    const key = await deriveKey(password, salt);
+    const decryptedBuffer = await window.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv },
+      key,
+      ciphertext
+    );
 
-          const decryptedBuffer = await window.crypto.subtle.decrypt(
-            { name: "AES-GCM", iv },
-            key,
-            ciphertext
-          );
+    const decryptedU8 = new Uint8Array(decryptedBuffer);
 
-          const u8 = pako.inflate(new Uint8Array(decryptedBuffer)); 
+    // ─── THE CRITICAL FIX ───
+    // Split the Hash from the Compressed Data BEFORE inflating.
+    // Pako cannot "see" the 32-byte hash or it throws "incorrect header check".
+    const storedHash = decryptedU8.slice(0, 32);
+    const compressedPayload = decryptedU8.slice(32);
 
-          const view = new DataView(u8.buffer);
-          const width = view.getUint16(0);
-          const height = view.getUint16(2);
-          const maskLen = view.getUint32(4);
+    // Now inflate ONLY the pixel data payload
+    const fullU8 = pako.inflate(compressedPayload);
+    // ────────────────────────
 
-          let offset = 8;
-          const compressedMask = [];
-          for (let i = 0; i < maskLen; i++) {
-            compressedMask.push(view.getUint32(offset));
-            offset += 4;
-          }
-          const pixels = u8.slice(offset);
-          const mask = decodeRLE(compressedMask, width * height);
+    // 4. IMAGE AUTHENTICITY CHECK
+    const scrambledArrayBuffer = await imgFile.arrayBuffer();
+    const recomputedHashBuffer = await window.crypto.subtle.digest(
+      "SHA-256",
+      scrambledArrayBuffer
+    );
+    const recomputedHash = new Uint8Array(recomputedHashBuffer);
 
-          const img = new Image();
-          img.src = e.target.result;
-          img.onload = () => {
-            const canvas = document.createElement("canvas");
-            canvas.width = width;
-            canvas.height = height;
-            const ctx = canvas.getContext("2d");
-            ctx.drawImage(img, 0, 0);
-            const imageData = ctx.getImageData(0, 0, width, height);
-            
-            let pIdx = 0;
-            for (let i = 0; i < mask.length; i++) {
-              if (mask[i] === 1) {
-                const p = i * 4;
-                imageData.data[p] = pixels[pIdx];
-                imageData.data[p+1] = pixels[pIdx+1];
-                imageData.data[p+2] = pixels[pIdx+2];
-                imageData.data[p+3] = 255;
-                pIdx += 3;
-              }
-            }
-            ctx.putImageData(imageData, 0, 0);
-            
-            setResult(canvas.toDataURL("image/png"));
-            setLoading(false);
-            toast.success("Decryption Successful", "Image restored.");
-          };
-        } catch (err) {
-          setLoading(false);
-          toast.error("Decryption Failed", "Incorrect key or corrupted file.");
-          console.error(err);
+    const hashMatch =
+      storedHash.length === recomputedHash.length &&
+      storedHash.every((byte, idx) => byte === recomputedHash[idx]);
+
+    if (!hashMatch) {
+      setLoading(false);
+      toast.error(
+        "Image Mismatch",
+        "This .bin file does not belong to this image or the image was modified."
+      );
+      return;
+    }
+
+    // 5. PARSE PIXEL DATA
+    // fullU8 is now purely the uncompressed pixel buffer [width, height, maskLen, etc.]
+    const view = new DataView(fullU8.buffer, fullU8.byteOffset, fullU8.byteLength);
+    const width = view.getUint16(0);
+    const height = view.getUint16(2);
+    const maskLen = view.getUint32(4);
+
+    let offset = 8;
+    const compressedMask = [];
+    for (let i = 0; i < maskLen; i++) {
+      compressedMask.push(view.getUint32(offset));
+      offset += 4;
+    }
+    const pixels = fullU8.slice(offset);
+    const mask = decodeRLE(compressedMask, width * height);
+
+    // 6. DRAW TO CANVAS
+    const img = new Image();
+    img.src = e.target.result; // The DataURL from imgFile
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, width, height);
+
+      let pIdx = 0;
+      for (let i = 0; i < mask.length; i++) {
+        if (mask[i] === 1) {
+          const p = i * 4;
+          imageData.data[p] = pixels[pIdx];
+          imageData.data[p + 1] = pixels[pIdx + 1];
+          imageData.data[p + 2] = pixels[pIdx + 2];
+          imageData.data[p + 3] = 255;
+          pIdx += 3;
         }
-      };
+      }
+      ctx.putImageData(imageData, 0, 0);
+
+      setResult(canvas.toDataURL("image/png"));
+      setLoading(false);
+      toast.success("Decryption Successful", "Image restored.");
+    };
+  } catch (err) {
+    setLoading(false);
+    toast.error("Decryption Failed", "Incorrect key or corrupted data.");
+    console.error("Decryption Error:", err);
+  }
+};
       br.readAsText(binFile);
     };
     ir.readAsDataURL(imgFile);
