@@ -113,6 +113,21 @@ export default function UploadPage() {
     }
 
     try {
+      // ── IMAGE AUTHENTICITY: Hash the exact PNG bytes that will be downloaded ──
+      // fetch() on a dataURL is efficient for all image sizes — no string iteration needed
+      const previewResponse = await fetch(preview);
+      const pngBytes = await previewResponse.arrayBuffer();
+      const imageHashBuffer = await window.crypto.subtle.digest("SHA-256", pngBytes);
+      const imageHash = new Uint8Array(imageHashBuffer); // 32 bytes — SHA-256
+
+      // Prepend the 32-byte image hash to the compressed pixel payload.
+      // Since the hash lives inside the AES-GCM ciphertext, an attacker
+      // cannot forge or strip it without the key.
+      const payloadWithHash = new Uint8Array(32 + binaryDataRef.current.length);
+      payloadWithHash.set(imageHash, 0);
+      payloadWithHash.set(binaryDataRef.current, 32);
+      // ─────────────────────────────────────────────────────────────────────────
+
       const salt = window.crypto.getRandomValues(new Uint8Array(16));
       const iv = window.crypto.getRandomValues(new Uint8Array(12));
       const key = await deriveKey(password, salt);
@@ -120,7 +135,7 @@ export default function UploadPage() {
       const encryptedBuffer = await window.crypto.subtle.encrypt(
         { name: "AES-GCM", iv },
         key,
-        binaryDataRef.current
+        payloadWithHash   // ← encrypt hash + payload together
       );
 
       const combined = new Uint8Array(salt.length + iv.length + encryptedBuffer.byteLength);
@@ -147,6 +162,7 @@ export default function UploadPage() {
       toast.error("Encryption Failed", "An error occurred.");
     }
   };
+
   return (
     <div style={containerStyle}>
       <ToastContainer toasts={toasts} removeToast={removeToast} />
